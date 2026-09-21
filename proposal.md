@@ -7,8 +7,22 @@ Brian Wang
 - [Constraints](#constraints)
 - [Proposed Solution](#proposed-solution)
   - [Interfaces](#interfaces)
+      - [Rocket Interface](#rocket-interface)
+      - [Controller interface](#controller-interface)
+        - [Simulink Exporting](#simulink-exporting)
+      - [Sensor model](#sensor-model)
+      - [Estimator interface](#estimator-interface)
+      - [Actuator model (within the plant)](#actuator-model-within-the-plant)
   - [Performance Aware Design Decisions](#performance-aware-design-decisions)
   - [Monte Carlo methodology](#monte-carlo-methodology)
+      - [Selection of QMC Sampling](#selection-of-qmc-sampling)
+      - [Error Modeling](#error-modeling)
+      - [Epistemic Error Modeling](#epistemic-error-modeling)
+      - [Aleatory Error Modeling](#aleatory-error-modeling)
+      - [Approach](#approach)
+        - [σ table:](#σ-table)
+        - [Exploration Strategy (approach to sampling epistemic points)](#exploration-strategy-approach-to-sampling-epistemic-points)
+        - [Example MonteCarlo Driver Config](#example-montecarlo-driver-config)
   - [Results and the Deliverable](#results-and-the-deliverable)
 - [Verification and validation](#verification-and-validation)
 - [Timeline](#timeline)
@@ -122,8 +136,6 @@ If all models use the same Simulink bus object, this wrapper is written once.
 	- fixed-step discrete solver
 	- data type that matches the data type of the estimator
 	- hardware implementation matching the build target (x86-64)
-
-
 ##### Sensor model
 We need to model:
 - individual rate of the sensor
@@ -148,9 +160,6 @@ Each added sensor is simply a new struct + config entry in the RunConfig, along 
 ```
 
 
-
-
-
 ##### Estimator interface
 We define a state estimate struct owned by the simulation driver. The estimator used is defined in the RunConfig and there is an option to select between truth state (no filter) and the MEKF (or any other filter selected). Since the MEKF is split, we add a custom adapter function to combine the estimated states into the single estimate struct.  
 
@@ -173,12 +182,6 @@ To consider both the dynamics of the actuator and its effectiveness, we model th
     "tau_s": 0.15, "rate_max": 0.8, "pos_lim": [0.0, 1.0] }
 ]
 ```
-
-
-
-
-
-
 
 
 
@@ -236,6 +239,8 @@ Access distributions from sources such as launch site climatology, manufacture s
 | turbulence realisation    | Aerodynamics + Environment |
 | launch day temperature    | Aerodynamics + Environment |
 | launch day pressure       | Aerodynamics + Environment |
+| rail angle                | Initial Conditions         |
+| rail azimuth              | Initial Conditions         |
 | motor lot to lot impulse  | Mass, Inertia + Propulsion |
 | thrust misalignment angle | Mass, Inertia + Propulsion |
 | mass                      | Mass, Inertia + Propulsion |
@@ -246,15 +251,8 @@ Access distributions from sources such as launch site climatology, manufacture s
 | sensor noise sequence     | Sensor Models              |
 | which samples drop        | Sensor Models              |
 
-
-
-
-and a Sample struct (the values being swept + seed)
-
-Cost multiplies as `(epistemic points) × (aleatory samples)`, so keep the outer loop coarse: corners and a few interior points of the interval box, not a dense grid.
-
 ##### Approach
-We run a sample over a nested loop as the different sources of error that we do not combine because they represent fundamentally different types of uncertainty. 
+We run a sample over a nested loop as the different sources of error that we do not combine because they represent fundamentally different types of uncertainty. Cost multiplies as `(epistemic points) × (aleatory samples)`, so keep the outer loop coarse: corners and a few interior points of the interval box, not a dense grid.
 
 Raw output is a p-box: a bounded family of CDFs rather than one curve. So the deliverable is not *"3% of flights go unstable"* but *"between 1% and 9%, and the width of that band is the cost of not knowing our aerodynamics."* 
 
@@ -338,27 +336,13 @@ results/<timestamp>_<config_hash>/
   figs/*.png         referenced by report.md
 ```
 
-The report contains summary of run config, along with sensitivity to different coefficients/parameters, failure rates, failure-mode breakdown, and command to replay any sample. 
-
-
-
-
-
-
-
-
-
-
----
-
+The report contains summary of run config, along with sensitivity to different coefficients/parameters, failure rates, failure-mode breakdown, and command to replay any sample.
 
 ## Verification and validation
 Post verification (does the code solve the equations correctly), we can validate the simulations against: 
 - RocketPy: Python 6-DOF, validated against real flights. Computes normal force from dimensions itself, but drag must be supplied. 
 - jsbsim: Independent EOM and integrated. Not independent aero.
 - Or upcoming flight data, wind tunnel data, ANSYS CFD. 
-
-
 
 
 ## Timeline
@@ -418,7 +402,7 @@ system identification against real flight telemetry if any exists.
 - We do not model chirp. We instead use gain and pure delay. The chirp would need to be at a frozen operating point that a rocket never holds. 
 - We do not consider frequency-dependent uncertainty. We assume that coefficient error is frequency-flat across the loop bandwidth. Thus, any unsteady aerodynamics (flow lags a changing $\alpha$) and structural bending modes are absent. 
 - A SysId optimizer wrapped around the plant that fits parameters to recorded flight telemetry. Out of scope for now. 
-
+- for the HITL: the HITL would be single thread, real-time driver instead of MonteCarlo driver that logs overruns such as issues with OS scheduler preemption, page faults, cache misses, interrupt handling, transport latency. The driver would sleep until the start of the next time frame. 
 ## Other Notes
 - Scope of Multithreading: One thread per complete flight due to sequential nature of time stepping. Parallelism is to occur across the Monte Carlo samples.
 - Flight computer: STM32H753ZIT6: Cortex-M7 at 240 MHz with a hardware double-precision FPU, 512 KB RAM, 2 MB flash.
