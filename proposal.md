@@ -43,6 +43,7 @@ We seek to implement a full 6-DOF rocket flight simulator in C++ fast enough to 
 - x86-64 Linux is priority, followed by Windows.
 
 ## Proposed Solution
+![[Screenshot 2026-09-19 at 7.47.51 PM.png]]
 
 ### Interfaces
 ##### Rocket Interface
@@ -184,7 +185,6 @@ To consider both the dynamics of the actuator and its effectiveness, we model th
 ```
 
 
-
 ### Performance Aware Design Decisions
 - Analysis of the step size and convergence should be done early as possible. It is the biggest performance lever. 
 - Interleave coefficient table. For a given mach and $\alpha$, we get each coefficient. For locality, we fetch them all in the same lookup. We trip the mach range too, which allows use of doubles. (Tables can still stay in L1). Cache the lookup cursor since the mach changes slowly between steps. 
@@ -204,9 +204,25 @@ Quasi-Monte Carlo replaces random points with a low discrepancy sequence (a set 
 We consider two types of uncertainty, Aleatory (inherent randomness modeled by a probability distribution) and Epistemic (uncertainty due to lack of knowledge, modeled with an interval). 
 - Aleatory example: wind on launch day. Epistemic example: Coeff. of Normal Force at $8° \alpha$ 
 
-Adding a new source of error requires a simple entry into the $\sigma$ table (described further below) and sample struct. Based on the blast radius of the change, the impact can be as simple as tweaking a model (a couple lines of change) to refactoring code (adding new physics/dynamics). 
+Adding a new source of error requires a simple entry into the $\sigma$ table (described further below) and the parameter manifest. Based on the blast radius of the change, the impact can be as simple as tweaking a model (a couple lines of change) to refactoring code (adding new physics/dynamics). 
 
 All QMC sampled values, along with a seed, are stored in a sample struct per simulation. 
+
+The `Sample` struct is generated at build time via a python script on a YAML config file. Names, units, model consuming it are dclared in the YAML and the python script emits the enum, the struct, and the name table:
+
+```cpp
+enum Param : int { k_CN, k_CD, k_Cm, rail_angle, /* ... */ N_PARAMS };
+inline constexpr const char* kParamNames[] = { "k_CN", "k_CD", ... };
+
+struct Sample {
+    double   v[N_PARAMS];
+    uint64_t seed;
+    constexpr double operator[](Param p) const { return v[p]; }
+    void dump(FILE*) const;     // named output for logs and the debugger
+};
+```
+
+Three things follow. The $\sigma$ table's `parameter` column is validated against `kParamNames` at load, so a typo becomes a startup error naming the row rather than a parameter silently dropped from the sweep. The sampler becomes a loop over `v[]` instead of one assignment per parameter. And the manifest and the $\sigma$ table are separate files on purpose: the manifest changes when new physics is added, the $\sigma$ table changes every study, and only the first triggers a rebuild. Every swept parameter is a continuous `double`. 
 ##### Epistemic Error Modeling
 Interval selected throughs sources such as research papers, manufacturing tolerance/spec sheet, spread from estimation methods, or documented engineering judgement. 
 
@@ -279,7 +295,6 @@ Raw output is a p-box: a bounded family of CDFs rather than one curve. So the de
 | `corners`   | `2^k` vertices of the box             | a bound, if monotone (P(fail) increasing/decreasing as single param moves) | nothing, if monotone |
 | `levels`    | `k x levels`, one parameter at a time | a tolerance per parameter                                                  | interactions         |
 | `hypercube` | `n` points scattered through the box  | interactions, an observed max                                              | no guarantee         |
-
 
 
 ###### Example MonteCarlo Driver Config
