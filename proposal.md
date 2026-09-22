@@ -11,7 +11,7 @@ Brian Wang
       - [Controller interface](#controller-interface)
         - [Simulink Exporting](#simulink-exporting)
       - [Sensor model](#sensor-model)
-      - [Estimator interface](#estimator-interface)
+      - [State estimate](#state-estimate)
       - [Actuator model (within the plant)](#actuator-model-within-the-plant)
   - [Performance Aware Design Decisions](#performance-aware-design-decisions)
   - [Monte Carlo methodology](#monte-carlo-methodology)
@@ -39,7 +39,7 @@ We seek to implement a full 6-DOF rocket flight simulator in C++ fast enough to 
 
 ## Constraints
 - Simulations run from launch through drogue deployment. Real-time flights are ~300s total with roughly 40s to apogee. Results should be reproducible and bit-exact for a given binary (requires pining the compiler + C library in a container). Any run must be replayable and visualizable. Target run latency is 10ms with baseline of 100s. 
-- Controllers are implemented in Simulink and can be exported in a C++ class. We assume all controllers run at the same estimator rate. 
+- Controllers are implemented in Simulink and can be exported in a C++ class. We assume all controllers run at the same control rate. 
 - x86-64 Linux is priority, followed by Windows.
 
 ## Proposed Solution
@@ -47,7 +47,7 @@ We seek to implement a full 6-DOF rocket flight simulator in C++ fast enough to 
 
 ### Interfaces
 ##### Rocket Interface
-The simulation consumes a sensor config, filter choice, N controllers, and actuator settings from config at runtime (in addition to the intervals and distributions being swept). 
+The simulation consumes a sensor config, state estimate error, N controllers, and actuator settings from config at runtime (in addition to the intervals and distributions being swept). 
 
 We define a RunConfig for the Rocket (SensorConfig, FilterChoice, ControllerSet, ActuatorConfig). Below is a rough example:
 ```json
@@ -62,11 +62,9 @@ We define a RunConfig for the Rocket (SensorConfig, FilterChoice, ControllerSet,
 
   "sensors": { "imu": { "...": "..." }, "baro": {}, "mag": {}, "gps": {} },
 
-  "filter": {
-    "type": "MEKF",                     // or "TRUTH"
-    "gyro_noise_radps": 0.002,          // what the filter BELIEVES
-    "accel_noise_mps2": 0.05,
-    "init_cov_scale": 1.0
+  "estimate_error": {                   // truth + sampled error, no filter
+    "att_bias_rad": 0.01, "att_drift_radps": 0.001,
+    "vel_bias_mps": 0.5, "corr_time_s": 10.0, "latency_s": 0.02
   },
 
   "controllers": [
@@ -83,7 +81,7 @@ We define a RunConfig for the Rocket (SensorConfig, FilterChoice, ControllerSet,
   "events": {
     "apogee": { "method": "brent" },
     "deploy": { "rule": "vel_ned_window", "threshold_mps": 0.2,
-                "source": "estimator", "t_end_buffer_s": 2.0 }
+                "source": "estimate", "t_end_buffer_s": 2.0 }
   },
 
   "logging": { "coarse_hz":0, "apogee_window_hz": 100 }
@@ -135,7 +133,7 @@ If all models use the same Simulink bus object, this wrapper is written once.
 	- non-finite support enabled
 	- MAT-file logging
 	- fixed-step discrete solver
-	- data type that matches the data type of the estimator
+	- data type that matches the data type of the state estimate
 	- hardware implementation matching the build target (x86-64)
 ##### Sensor model
 We need to model:
@@ -161,13 +159,12 @@ Each added sensor is simply a new struct + config entry in the RunConfig, along 
 ```
 
 
-##### Estimator interface
-We define a state estimate struct owned by the simulation driver. The estimator used is defined in the RunConfig and there is an option to select between truth state (no filter) and the MEKF (or any other filter selected). Since the MEKF is split, we add a custom adapter function to combine the estimated states into the single estimate struct.  
-
-Configuration between sending true-state to the controller vs MEKF estimations allows for:
-- attribution of a failed run to factors outside of estimation error. 
-- answers to the problem this project intends to solve without a fully implemented MEKF
-- allows coarse sweeping to locate a stability boundary, with MEKF estimations densely run near it (if we modify the MC methodology described later). 
+##### State estimate
+We define a state estimate struct owned by the simulation driver, filled from truth plus a sampled error. There is no estimator module. Abhay's MEKF is tuned against real flight logs, so any sensor noise we invent here would only tune a filter against our own fiction. What we take from him instead is the error characterization from real flight residuals.
+```cpp
+void estimate(const State& truth, const EstError& err, double t, StateEstimate& out);
+```
+Error is bias, drift rate, correlation time, and latency. Zero error is a sample rather than a separate mode, so nominal and perturbed runs go through identical code. White noise is not the interesting part: zero-mean noise on the estimate averages out in the controller, while bias and latency eat phase margin. For HITL the real filter runs onboard and we send raw measurements instead.
 ##### Actuator model (within the plant)
 To consider both the dynamics of the actuator and its effectiveness, we model the dynamics with first order lag, rate/movement limit, and position limit. Dynamics go straight into the integrator. The effectiveness is determined by an aerodynamics and environment submodule in the plant that takes in the rocket's physical configuration. 
 ```json
@@ -189,7 +186,7 @@ To consider both the dynamics of the actuator and its effectiveness, we model th
 - Analysis of the step size and convergence should be done early as possible. It is the biggest performance lever. 
 - Interleave coefficient table. For a given mach and $\alpha$, we get each coefficient. For locality, we fetch them all in the same lookup. We trip the mach range too, which allows use of doubles. (Tables can still stay in L1). Cache the lookup cursor since the mach changes slowly between steps. 
 - Divergent samples stop sooner than drogue deploy.
-- Per-phase (aero, EOM, estimator, etc.) timing counters are placed behind a compile flag. Not really a profiler, just accumulated counters. Allows targeted optimization. 
+- Per-phase (aero, EOM, state estimate, etc.) timing counters are placed behind a compile flag. Not really a profiler, just accumulated counters. Allows targeted optimization. 
 - Persistent worker pool that fetch from a atomic job queue. Writing of results requires no synchronization as each index is written by exactly one thread. At ~8 KB per record (summary + coarse trajectory + apogee window) a 20,000-sample sweep holds ~160 MB in RAM and writes it once, after every worker joins
 - Pre-touch the results array before the sweep, or first-write page faults land on the sim thread inside the hot loop.
 - Have each worker thread grabs 64 indices at a time (conventional chunk size, can be adjusted) that they then work on rather than grabbing one index at a time from the job queue in the MonteCarlo Driver. 
@@ -237,7 +234,7 @@ Interval selected throughs sources such as research papers, manufacturing tolera
 | CP location, transonic shift     | held constant through transonic                    | Aerodynamics                                       |
 | controller gain error            | 1.0                                                | Controllers                                        |
 | controller delay                 | 0                                                  | Controllers                                        |
-| filter tuning mismatch           | filter `R` vs actual sensor sigma                  | Estimator                                          |
+| state estimate error             | bias, drift, corr time, latency — from Abhay       | State Estimate                                     |
 | sensor dropout rate              | 0                                                  | Sensor Models                                      |
 | IMU bias vs temperature coeff    | absent                                             | Sensor Models                                      |
 | actuator `tau`                   | 0.02 s                                             | Actuator Dynamics                                  |
@@ -360,64 +357,22 @@ Post verification (does the code solve the equations correctly), we can validate
 - Or upcoming flight data, wind tunnel data, ANSYS CFD. 
 
 
-## Timeline
-
-Rough timeline generated by Claude. 
-
-**Stage 0:** unblock. What counts as unstable/failure and if codegen settings are confirmed. 
-
-**Stage 1:** data and scaffolding. Vehicle data loads, integrator runs, aero
-tables re-exported over a sensible Mach x alpha grid, trimmed to Mach 3.
-`experimental_v1` loads with four canards and no code change, point mass
-matches OpenRocket apogee, order of accuracy confirms 4th order.
-
-**Stage 2:** the plant. 6-DOF vehicle that flies correctly with nothing
-controlling it, matching RocketPy trajectory and stability margin curve with no
-wind. Per flight cost measured and broken down by phase.
-
-**Stage 3:** the first number. Disturbances in the plant and in the sigma
-table, then one at a time boundary sweeps producing a tolerance table with out
-of table counters beside it. Still single threaded. This is the defensible
-deliverable and the point of the project.
-
-**Stage 4:** scale. The Monte Carlo driver: sampler, work queue, worker pool,
-four tier logging, results to disk. Same seed gives bit identical results on
-any core count, and a run replays from its own output directory.
-
-**Stage 5:** closed loop. Actuator dynamics and controllers in the loop,
-control effectiveness in the aero block, gain and delay sweeps standing in for
-the frequency driver. Perturb roll positive, confirm the commanded deflection
-is restoring, record it in `conventions.md`.
-
-**Stage 6:** estimator. Sensor models and the MEKF behind the estimator
-interface, with truth state as the baseline. The difference between the two
-over one ensemble is the stability margin the estimator costs, and it is a
-deliverable in its own right.
-
-**Stage 7:** spin can. Two body roll dynamics for `experimental_v1`: two extra
-states, an inertia split, and a regularised bearing friction model with its
-epsilon documented.
-
-**The boundary.** Everything above is the engine. It is done when it produces
-tolerance numbers for aero, controller and estimator, replayably, in an
-ensemble that finishes overnight.
-
-**After the engine works.** Listed so they stop being re-proposed mid cycle: CI
-gate on pull requests with the full ensemble nightly, a recovery model for
-drogue and main descent, HITL once someone solves clock synchronisation, and
-system identification against real flight telemetry if any exists.
-
 ## Out of Scope
 - The simulation focuses on testing the rocket's performance rather than elements such as MEKF implementation validation, Code quality CI. 
 - Descent/parachute simulation is considered a reach end-of-year goal by Rohan. 
 - MacOS deployment of the simulations. Priority is x86-64 Linux, followed by Windows. 
 - Optimization such as SIMD (single instruction, multiple data), custom allocators (like object pools), lock free structures, GPU offload, distributed execution beyond a job pool are all out of scope. 
-- NASA has a library called Trick recommended by Rohan. It is more of a scheduling framework where you write models and its interface code generator parses your headers and schedules jobs. It was built for multiple subsystem models from many teams over decades,  a pressure that does not exist with WPI's HPRC team. May revisit when designing HITL system. 
+- An originally proposed "estimator model" where an MEKF/direct truth state could be interchangeable. Abhay, the student working on the MEKF, can provide empirical error bounds from real flight residuals. Integrating an MEKF into the sim yields nothing about estimator accuracy, since the sensor noise would be our own invention. So we scope hammered it down to no estimator module. The controller reads a state estimate filled from truth plus sampled error (bias, drift rate, correlation time, latency). 
+- RTOS integration from the flight software. The sim calls the shared state machine and controllers once per control tick, as if the flight computer runs instantly. Scheduling delay is covered by the swept controller delay and estimate latency rather than a model of tasks and priorities. The real scheduler is only exercised in HITL, where the board runs its own firmware. Current flight software is an Arduino superloop with no RTOS anyway. 
+- NASA has a library called Trick recommended by Rohan. It is more of a scheduling framework where you write models and its interface code generator parses your headers and schedules jobs. It was built for multiple subsystem models from many teams over decades, a pressure that does not exist with WPI's HPRC team. May revisit when designing HITL system. 
 - Any built in screening (ex. Morris pass) to cut down on the number of epistemic parameters to those that actually matter. Any inputted epistemic parameters and intervals are assumed to be important to test. 
 - We do not model chirp. We instead use gain and pure delay. The chirp would need to be at a frozen operating point that a rocket never holds. 
 - We do not consider frequency-dependent uncertainty. We assume that coefficient error is frequency-flat across the loop bandwidth. Thus, any unsteady aerodynamics (flow lags a changing $\alpha$) and structural bending modes are absent. 
 - A SysId optimizer wrapped around the plant that fits parameters to recorded flight telemetry. Out of scope for now. 
-- for the HITL: the HITL would be single thread, real-time driver instead of MonteCarlo driver that logs overruns such as issues with OS scheduler preemption, page faults, cache misses, interrupt handling, transport latency. The driver would sleep until the start of the next time frame. 
+- for the HITL: the HITL would be single thread, real-time driver instead of MonteCarlo driver that logs overruns such as issues with OS scheduler preemption, page faults, cache misses, interrupt handling, transport latency. The driver would sleep until the start of the next time frame. The controllers would run on an onboard MEKF while the servos within the Gimbal are driven by the simulation plant. 
+- Note the eventual goal of also having any changes to the open rocket file across subteams runs a set of C++ sims and automatically creates a PR to update the simulation config.
+
+
 ## Other Notes
 - Scope of Multithreading: One thread per complete flight due to sequential nature of time stepping. Parallelism is to occur across the Monte Carlo samples.
 - Flight computer: STM32H753ZIT6: Cortex-M7 at 240 MHz with a hardware double-precision FPU, 512 KB RAM, 2 MB flash.
